@@ -18,6 +18,14 @@ services:
       - { key: ADMIN_TG_IDS, sync: false }        # optional
       - { key: ADMIN_EMAILS, sync: false }
       - { key: ALLOWED_ORIGINS, sync: false }     # frontend sites, comma se
+      - { key: ADMIN_LOGIN_EMAIL, sync: false }     # admin panel login email
+      - { key: ADMIN_LOGIN_PASSWORD, sync: false }  # admin panel password (12+ chars)
+      - { key: ADMIN_LOGIN_PIN, sync: false }       # admin panel PIN (6+ digits)
+      - { key: ADMIN_LOGIN_EMAIL_2, sync: false }   # optional: admin 2..5 (same 3 keys with _2, _3, _4, _5)
+      - { key: ADMIN_LOGIN_PASSWORD_2, sync: false }
+      - { key: ADMIN_LOGIN_PIN_2, sync: false }
+      - { key: ADMIN_SESSION_HOURS, value: "12" }  # login session length (1-72)
+      - { key: SETUP_SHOW_ID, sync: false }         # sirf setup mein 1 rakho (bot strangers ko unka Telegram ID dikhaye); baad mein delete
       - { key: FIREBASE_MAIN_PROJECT_ID, sync: false }
       - { key: FIREBASE_WEB_API_KEY, sync: false }
       - { key: FIREBASE_REFERER, sync: false }
