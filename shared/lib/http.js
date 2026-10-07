@@ -3,6 +3,7 @@
 import { env, HttpError, safeEq, clientIp } from './base.js';
 import * as store from './store.js';
 import { verifyInternal } from './internal.js';
+import { isAdminToken, verifyAdminToken } from './adminauth.js';
 
 const originOf = (o) => String(o || '').toLowerCase().replace(/\/+$/, '');
 export const ERRNO = { invalid: 1110567, stopped: 1110621, maintenance: 1110642, rate: 1110688, blocked: 1110704 };
@@ -113,8 +114,14 @@ export function createService({ name, cfg, guard, verifyToken, onEvent }) {
       if (o.auth === 'user' || o.auth === 'admin') {
         const h = req.headers.authorization || '';
         if (!h.startsWith('Bearer ')) throw new HttpError(401, 'no_token', 'Please login');
-        try { user = await verifyToken(h.slice(7)); } catch { throw new HttpError(401, 'bad_token', 'Session expired. Login again.'); }
-        if (o.auth === 'admin' && !(user.admin === true || adminEmails().includes(String(user.email || '').toLowerCase()))) throw new HttpError(403, 'forbidden', 'Admin only');
+        const tok = h.slice(7);
+        if (o.auth === 'admin' && isAdminToken(tok)) {          // admin panel session from /admin/login (env email + password + PIN)
+          user = verifyAdminToken(tok);
+          if (!user) throw new HttpError(401, 'bad_token', 'Session expired. Login again.');
+        } else {
+          try { user = await verifyToken(tok); } catch { throw new HttpError(401, 'bad_token', 'Session expired. Login again.'); }
+          if (o.auth === 'admin' && !(user.admin === true || adminEmails().includes(String(user.email || '').toLowerCase()))) throw new HttpError(403, 'forbidden', 'Admin only');
+        }
       } else if (o.auth === 'internal') verifyInternal(req, body);
       else if (o.auth === 'cron') { const s = env('CRON_SECRET'); if (!s || !safeEq(req.headers.authorization || '', 'Bearer ' + s)) throw new HttpError(401, 'bad_cron', 'Unauthorized'); }
 
