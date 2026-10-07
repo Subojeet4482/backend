@@ -5,6 +5,11 @@ import * as store from './store.js';
 import { verifyInternal } from './internal.js';
 import { isAdminToken, verifyAdminToken } from './adminauth.js';
 
+// ADMIN PANEL KEY: panel har /admin/* request ke saath header `X-Panel-Key` bhejta hai. Key sahi ho to origin check skip hota hai
+// (mobile / file:// / kisi bhi hosting se panel chal sakta hai). Phir bhi email + password + PIN + lock/block system poora lagta hai.
+// Render env: ADMIN_PANEL_KEY (comma se multiple allowed). Khali ho to ye feature OFF hai.
+const PANEL_HDR = 'Content-Type, Authorization, X-Panel-Key';
+const panelKeys = () => env('ADMIN_PANEL_KEY').split(',').map((s) => s.trim()).filter((s) => s.length >= 16);
 const originOf = (o) => String(o || '').toLowerCase().replace(/\/+$/, '');
 export const ERRNO = { invalid: 1110567, stopped: 1110621, maintenance: 1110642, rate: 1110688, blocked: 1110704 };
 const MSG = {
@@ -69,11 +74,20 @@ export function createService({ name, cfg, guard, verifyToken, onEvent }) {
     };
 
     if (url.pathname === '/health') return send(200, { ok: true, service: name, time: Date.now() });
+    const isAdminPath = url.pathname.startsWith('/admin/');
+    const keyHdr = String(req.headers['x-panel-key'] || '').slice(0, 200);
+    const keys = isAdminPath ? panelKeys() : [];
+    const keyOk = !!keyHdr && keys.some((k) => safeEq(k, keyHdr));
+    if (keys.length && method === 'OPTIONS') {                       // preflight carries no custom header; it reveals nothing, the real request is checked
+      cors = { 'Access-Control-Allow-Origin': rawOrigin || '*', Vary: 'Origin', 'Access-Control-Allow-Headers': PANEL_HDR, 'Access-Control-Allow-Methods': 'GET,POST,PUT,DELETE,OPTIONS', 'Access-Control-Max-Age': '600' };
+      return send(204, {});
+    }
+    if (keyOk) cors = { 'Access-Control-Allow-Origin': rawOrigin || '*', Vary: 'Origin', 'Access-Control-Allow-Headers': PANEL_HDR, 'Access-Control-Allow-Methods': 'GET,POST,PUT,DELETE,OPTIONS' };
     const m = match(method === 'OPTIONS' ? 'POST' : method, parts) || (method === 'OPTIONS' ? match('GET', parts) || match('PUT', parts) || match('DELETE', parts) : null);
     if (!m) return isNav(req) ? sendHtml(400, errorPage(ERRNO.invalid, MSG.invalid)) : send(404, fail('not_found', 'Not found'));
     const { r, params } = m, o = r.opts;
     const internalish = ['internal', 'cron'].includes(o.auth) || !!o.skipGuard;
-    const needsOrigin = !internalish && o.origin !== false;
+    const needsOrigin = !internalish && o.origin !== false && !keyOk;
 
     // ---- cheap rejects: no DB / Redis touched ----
     try {
@@ -84,9 +98,15 @@ export function createService({ name, cfg, guard, verifyToken, onEvent }) {
     let c; try { c = await cfg.get(); } catch { c = {}; }
     const allowed = [...(c.allowedOrigins || []), ...env('ALLOWED_ORIGINS').split(',')].map(originOf).filter(Boolean);
     const okOrigin = !!origin && allowed.includes(origin);
-    if (okOrigin) cors = { 'Access-Control-Allow-Origin': rawOrigin, Vary: 'Origin', 'Access-Control-Allow-Headers': 'Content-Type, Authorization', 'Access-Control-Allow-Methods': 'GET,POST,PUT,DELETE,OPTIONS', 'Access-Control-Max-Age': '600' };
+    if (okOrigin && !keyOk) cors = { 'Access-Control-Allow-Origin': rawOrigin, Vary: 'Origin', 'Access-Control-Allow-Headers': PANEL_HDR, 'Access-Control-Allow-Methods': 'GET,POST,PUT,DELETE,OPTIONS', 'Access-Control-Max-Age': '600' };
 
     if (needsOrigin && !okOrigin) {
+      if (keyHdr && keys.length) {                                              // key bheji gayi par galat -> block system
+        try {
+          const f = await guard.loginFail(ip, 'panelkey', { ...c, loginIpMax: 5, loginBlockHours: 24, loginEmailLockMin: 60 });
+          event('panel_key_bad', { ip, origin, path: url.pathname, blocked: f.blocked });
+        } catch {}
+      }
       const denied = (c.deniedOrigins || []).map(originOf).includes(origin);
       if (!denied && origin.length < 200 && /^https?:\/\//.test(origin)) {          // remember the last 10 unknown domains for the bot
         try { if (cfg.reqPush && (await store.once('ff:dseen:' + origin, 300)) && (await store.incr('ff:dreqcap', 60)) <= 20) await cfg.reqPush({ o: origin, t: Date.now(), ip }); } catch {}
