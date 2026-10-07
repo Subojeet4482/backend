@@ -10,6 +10,7 @@ import { checkKey } from './logkey.js';
 import { purgeExpired } from './state.js';
 import { LOG_PAGE } from './logpage.js';
 import * as A from './adminapi.js';
+import { adminLoginEnabled, checkAdminCreds, issueAdminToken, isAdminEmail } from './adminauth.js';
 import * as W from './wallet.js';
 import { handleUpdate } from './bot.js';
 import { archiveOld, purgeIpLogs, cleanupPending, sendSnapshot } from './backup.js';
@@ -143,6 +144,39 @@ export function registerAll() {
   });
   svc.add('POST', '/match/slot', { auth: 'user', rl: [10, 60] }, (ctx) => W.pickSlot(ctx.user.uid, ctx.body));
   svc.add('GET', '/match/:id/room', { auth: 'user', rl: [20, 60] }, (ctx) => W.roomFor(ctx.user.uid, ctx.params.id));
+
+  // ---------- ADMIN PANEL LOGIN: email + password + PIN from Render env ----------
+  // Panel sends them here; on success it gets a signed session token (Authorization: Bearer ...) valid on core AND /chat admin routes.
+  // Rules: 5 wrong tries from one IP (within 1h) -> IP blocked 24h. 10 wrong tries on a real admin email -> that admin email locked 24h
+  // (even the right password is refused during the lock; an owner can unlock with the bot command /unlockadmin <email>).
+  svc.add('POST', '/admin/login', { rl: [10, 60] }, async (ctx) => {
+    if (!adminLoginEnabled()) throw new HttpError(503, 'admin_login_off', 'Admin login is not configured');
+    const email = String(ctx.body.email || '').trim().toLowerCase().slice(0, 254), known = isAdminEmail(email);
+    const gk = known ? 'admin:' + email : 'admin:unknown', cc = { ...ctx.cfg, loginIpMax: 5, loginBlockHours: 24, loginEmailMax: 10, loginEmailLockMin: 1440 };
+    if (known && (await guard.emailLocked(gk, cc))) throw new HttpError(429, 'account_locked', 'This admin account is locked for 24 hours after too many wrong attempts.');
+    const acct = await checkAdminCreds({ email, password: String(ctx.body.password || '').slice(0, 256), pin: String(ctx.body.pin || '').slice(0, 32) });
+    if (!acct) {
+      const f = await guard.loginFail(ctx.ip, gk, cc);
+      await logs.ipLog('admin_login_fail', { ip: ctx.ip, ua: ctx.ua, email: email.slice(0, 80), left: f.left });
+      if (f.blocked) {
+        await notifyAdmins(`🚫 <b>IP blocked</b> (admin panel login) for 24h\nIP: <code>${esc(ctx.ip)}</code>`, kb([[['✅ Unblock', 'ip:u:' + ctx.ip]]]));
+        throw new HttpError(403, 'ip_blocked', 'Too many wrong attempts. Blocked for 24 hours.');
+      }
+      if (known && f.emailFails >= 10) {
+        await guard.lockEmail(gk, 1440, f.emailFails);
+        await logs.audit('admin_email_locked', email, { ip: ctx.ip });
+        await notifyAdmins(`🔒 <b>Admin account locked 24h</b>\n${esc(email)}\n10 wrong login attempts. Last IP: <code>${esc(ctx.ip)}</code>\nUnlock: <code>/unlockadmin ${esc(email)}</code> (owner)`);
+        throw new HttpError(429, 'account_locked', 'This admin account is locked for 24 hours after too many wrong attempts.');
+      }
+      throw new HttpError(401, 'invalid_credentials', 'Invalid email, password or PIN', { attemptsLeft: f.left });   // never say which one was wrong
+    }
+    await guard.loginOk(ctx.ip, gk);
+    const t = issueAdminToken(acct);
+    await logs.audit('admin_login', acct.email, { ip: ctx.ip, ua: String(ctx.ua || '').slice(0, 120) });
+    notifyAdmins(`🔐 <b>Admin panel login</b>\n${esc(acct.email)}\nIP: <code>${esc(ctx.ip)}</code>`).catch(() => {});
+    return { token: t.token, expiresAt: t.expiresAt, email: acct.email };
+  });
+  svc.add('GET', '/admin/me', { auth: 'admin', rl: [60, 60] }, async (ctx) => ({ email: ctx.user.email, expiresAt: ctx.user.exp || null }));
 
   // ---------- ADMIN (panel + same logic the Telegram bot uses) ----------
   svc.add('GET', '/admin/withdrawals', { auth: 'admin' }, async () => ({ items: await W.pendingWithdrawals(20) }));
