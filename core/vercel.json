@@ -1,0 +1,9 @@
+{
+  "version": 2,
+  "rewrites": [{ "source": "/(.*)", "destination": "/api/index" }],
+  "functions": { "api/index.js": { "maxDuration": 60 } },
+  "crons": [
+    { "path": "/cron/daily", "schedule": "30 21 * * *" },
+    { "path": "/cron/weekly", "schedule": "0 22 * * 0" }
+  ]
+}
