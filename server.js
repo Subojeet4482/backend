@@ -155,7 +155,7 @@ server.keepAliveTimeout = 65000; server.headersTimeout = 66000;
 server.listen(PORT, '0.0.0.0', () => {
   log(`listening on :${PORT}`, SELF);
   const set = (k) => (process.env[k] ? 'set' : 'MISSING');
-  log('env check ->', ['KEY64_1', 'KEY64_2', 'KEY64_3', 'TG_BOT_TOKEN', 'CHAT_TG_BOT_TOKEN', 'TG_WEBHOOK_SECRET', 'OWNER_TG_IDS', 'ADMIN_TG_IDS', 'INTERNAL_SECRET', 'ALLOWED_ORIGINS', 'ADMIN_LOGIN_EMAIL', 'ADMIN_LOGIN_PASSWORD', 'ADMIN_LOGIN_PIN', 'ADMIN_LOGIN_EMAIL_2'].map((k) => `${k}=${set(k)}`).join(' '));
+  log('env check ->', ['KEY64_1', 'KEY64_2', 'KEY64_3', 'TG_BOT_TOKEN', 'CHAT_TG_BOT_TOKEN', 'TG_WEBHOOK_SECRET', 'OWNER_TG_IDS', 'ADMIN_TG_IDS', 'INTERNAL_SECRET', 'ALLOWED_ORIGINS', 'ADMIN_PANEL_KEY', 'ADMIN_LOGIN_EMAIL', 'ADMIN_LOGIN_PASSWORD', 'ADMIN_LOGIN_PIN', 'ADMIN_LOGIN_EMAIL_2'].map((k) => `${k}=${set(k)}`).join(' '));
 });
 
 for (const w of adminLoginWarnings()) console.warn('[server] ' + w);
