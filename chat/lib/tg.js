@@ -2,6 +2,9 @@ import { env, safeEq } from './base.js';
 export const esc = (s) => String(s ?? '').replace(/[&<>]/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;' }[c]));
 export const kb = (rows) => ({ inline_keyboard: rows.map((r) => r.map(([text, cb]) => ({ text, callback_data: cb }))) });
 export const adminIds = () => env('ADMIN_TG_IDS').split(',').map((s) => s.trim()).filter(Boolean);
+// Strangers get a reply (their Telegram ID) ONLY during setup: no owner configured yet, or SETUP_SHOW_ID=1.
+// Otherwise the bot stays silent to anyone who is not an admin.
+export const showIdToStrangers = () => env('SETUP_SHOW_ID') === '1' || !(env('OWNER_TG_IDS') || env('ADMIN_TG_IDS')).trim();
 export function webhookOk(req) { const s = env('TG_WEBHOOK_SECRET'); return !!s && safeEq(req.headers['x-telegram-bot-api-secret-token'] || '', s); }
 export function makeTg(token) {
   const call = async (method, payload) => {
