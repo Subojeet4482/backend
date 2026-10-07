@@ -13,7 +13,7 @@ export function makeState(getDb) {
   };
 }
 // delete expired helper docs (bot_state, login_fails). Run from the daily job.
-export async function purgeExpired(getDb, cols = ['bot_state', 'login_fails']) {
+export async function purgeExpired(getDb, cols = ['bot_state', 'login_fails', 'cron_runs']) {
   let n = 0;
   for (const c of cols) {
     try {
