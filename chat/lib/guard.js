@@ -44,6 +44,9 @@ export function makeGuard(getDb) {
       const s = await fails().doc('em_' + sha(email)).get();
       return s.exists && s.data().exp > Date.now() && s.data().n >= (c.loginEmailMax || 10);
     },
+    // hard lock an email for N minutes starting NOW (used for admin accounts: 10 wrong tries -> 24h)
+    async lockEmail(email, minutes, n) { await fails().doc('em_' + sha(email)).set({ n, exp: Date.now() + minutes * 60000 }); },
+    async unlockEmail(email) { await fails().doc('em_' + sha(email)).delete(); },
     async loginOk(ip, email) {                       // reset counters, but only write if something exists
       const refs = [fails().doc('ip_' + sha(ip)), fails().doc('em_' + sha(email))], snaps = await Promise.all(refs.map((r) => r.get()));
       await Promise.all(snaps.map((s, i) => (s.exists ? refs[i].delete() : null)));
