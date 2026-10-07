@@ -1,0 +1,24 @@
+# Render Blueprint: New + > Blueprint > repo select. Ek hi service (core + chat dono, bot polling se chalta hai).
+services:
+  - type: web
+    name: ff-backend
+    runtime: node
+    plan: free
+    buildCommand: npm install --omit=dev
+    startCommand: npm start
+    healthCheckPath: /health
+    envVars:
+      - { key: NODE_VERSION, value: "20" }
+      - { key: TG_BOT_TOKEN, sync: false }        # core bot (BotFather)
+      - { key: OWNER_TG_IDS, sync: false }        # aapki numeric Telegram ID (comma se multiple)
+      - { key: KEY64_1, sync: false }             # main Firebase service account (base64)
+      - { key: KEY64_2, sync: false }             # chat Firebase service account (base64)
+      - { key: KEY64_3, sync: false }             # archive Firebase service account (base64)
+      - { key: CHAT_TG_BOT_TOKEN, sync: false }   # optional: chat bot ka alag token
+      - { key: ADMIN_TG_IDS, sync: false }        # optional
+      - { key: ADMIN_EMAILS, sync: false }
+      - { key: ALLOWED_ORIGINS, sync: false }     # frontend sites, comma se
+      - { key: FIREBASE_MAIN_PROJECT_ID, sync: false }
+      - { key: FIREBASE_WEB_API_KEY, sync: false }
+      - { key: FIREBASE_REFERER, sync: false }
+      - { key: ROOM_PRIVATE, sync: false }
