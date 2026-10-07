@@ -1,7 +1,7 @@
 // Telegram control center for the CORE service. Owners = env OWNER_TG_IDS, admins = added by owners.
 import { tg, cfg, guard, logs, roles, state } from './svc.js';
 import { db } from './fb.js';
-import { esc, kb, ladder } from './tg.js';
+import { esc, kb, ladder, showIdToStrangers } from './tg.js';
 import { env, HttpError } from './base.js';
 import { callInternal } from './internal.js';
 import { makeDomainUI } from './domreq.js';
@@ -9,6 +9,9 @@ import * as W from './wallet.js';
 import * as D from './dataops.js';
 import { archiveOld, purgeIpLogs, sendSnapshot } from './backup.js';
 import { newKey, revokeKey } from './logkey.js';
+import crypto from 'node:crypto';
+import * as PA from './paneladmins.js';
+import { hashSecret, envAccounts, MAX_PANEL_LOGINS } from './adminauth.js';
 
 const audit = (a, actor, d) => logs.audit(a, actor, d);
 const dom = makeDomainUI({ cfg, audit });
@@ -17,6 +20,15 @@ const BACK = [['⬅️ Menu', 'm:home']];
 const OPNAME = { b: '💾 BACKUP', d: '🗑 DELETE', u: '📤 UPLOAD' };
 const count = async (q) => { try { return (await q.count().get()).data().count; } catch { return '?'; } };
 const lbl = (scope) => (scope === 'A' ? 'ALL users' : `user <code>${esc(scope)}</code>`);
+
+
+// ---- panel logins (owner adds/removes admin-panel email + password + PIN from Telegram) ----
+const PA_EMAIL = /^[^\s@]{1,64}@[^\s@]{1,255}\.[^\s@]{2,}$/;
+const genPw = () => crypto.randomBytes(15).toString('base64url');
+const genPin = () => String(crypto.randomInt(0, 1e8)).padStart(8, '0');
+const paPwPrompt = (email) => ({ text: `🔑 <b>Add panel login 2/3</b>\n<code>${esc(email)}</code>\n\nSend the <b>password</b> (12+ characters). I delete your message right after.\nOr tap 🎲 to generate a strong one.`, kb: kb([[['🎲 Generate password', 'pa:gp']], [['✖ Cancel', 'pa:l']]]) });
+const paPinPrompt = (email) => ({ text: `🔢 <b>Add panel login 3/3</b>\n<code>${esc(email)}</code>\n\nSend the <b>PIN</b> (6–12 digits). I delete your message right after.\nOr tap 🎲 to generate one.`, kb: kb([[['🎲 Generate PIN', 'pa:gn']], [['✖ Cancel', 'pa:l']]]) });
+const paConfirm = (email, n) => ladder({ n, total: 2, title: `Add panel login <code>${esc(email)}</code>?`, body: n === 1 ? 'Password and PIN are saved as hashes (nobody can read them later). This login works on the admin panel.' : 'Final check — is this the right email?', next: n === 1 ? 'pa:ok:2' : 'pa:ok:9', cancel: 'pa:l', danger: false });
 
 const views = {
   async home(ctx) {
@@ -62,9 +74,14 @@ const views = {
     const c = await cfg.get();
     return { text: `⏯ <b>Server control</b>\nStatus: ${c.stopped ? '⛔ <b>STOPPED</b> — every request gets an error page' : '🟢 <b>RUNNING</b>'}\n\n/stop = stop • /startserver = start\n(applies to core + chat, takes up to ~30 s)`, kb: kb([[c.stopped ? ['▶️ Start server', 'srv:start:1'] : ['⛔ Stop server', 'srv:stop:1']], BACK]) };
   },
+  async pa() {
+    const l = PA.list(), e = envAccounts();
+    return { text: `🔑 <b>Admin panel logins</b>\nAdded here: <b>${l.length}/${MAX_PANEL_LOGINS}</b>\n${l.map((a) => `• ${esc(a.email)}`).join('\n') || '—'}${e.length ? `\n\n<b>From server env</b> (permanent, change in Render)\n${e.map((a) => `• ${esc(a.email)}`).join('\n')}` : ''}\n\nWrong-password rules: 5 tries → IP blocked 24h • 10 tries on one login → that login locked 24h (/unlockadmin &lt;email&gt;).`,
+      kb: kb([...(l.length < MAX_PANEL_LOGINS ? [[['➕ Add login', 'pa:add']]] : []), ...l.map((a) => [[`🗑 Delete ${a.email}`.slice(0, 60), `pa:d:${a.sid}:1`]]), [['⬅️ Admins', 'adm:l']]]) };
+  },
   async adm(ctx) {
     const r = await roles.get();
-    return { text: `👑 <b>Owners</b>\n${r.owners.map((x) => `• <code>${x}</code>`).join('\n') || '—'}\n\n<b>Admins</b>\n${r.admins.map((x) => `• <code>${x}</code>`).join('\n') || '—'}`, kb: kb([[['➕ Add admin', 'adm:add']], ...r.admins.map((x) => [[`🗑 Remove ${x}`, `adm:rm:${x}:1`]]), BACK]) };
+    return { text: `👑 <b>Owners</b>\n${r.owners.map((x) => `• <code>${x}</code>`).join('\n') || '—'}\n\n<b>Admins</b>\n${r.admins.map((x) => `• <code>${x}</code>`).join('\n') || '—'}`, kb: kb([[['➕ Add admin', 'adm:add'], ['🔑 Panel logins', 'pa:l']], ...r.admins.map((x) => [[`🗑 Remove ${x}`, `adm:rm:${x}:1`]]), BACK]) };
   },
 };
 
@@ -142,7 +159,7 @@ export async function handleUpdate(u) {
   if (!(await roles.isAdmin(from.id))) {
     console.warn('[tg:core] NOT ADMIN', from.id, from.username || '', JSON.stringify(dbgText));
     const cid = (msg?.chat || cb?.message?.chat)?.id;
-    if (cid) await tg.send(cid, `⛔ <b>Access denied</b>\nYou are not an admin of this bot.\nYour Telegram ID: <code>${from.id}</code>`).catch(() => {});
+    if (cid && showIdToStrangers()) await tg.send(cid, `⛔ <b>Access denied</b>\nYou are not an admin of this bot.\nYour Telegram ID: <code>${from.id}</code>`).catch(() => {});
     return;
   }
   try { if (u.update_id && !(await state.claim('upd' + u.update_id))) { console.log('[tg:core] duplicate update skipped', u.update_id); return; } }
@@ -211,6 +228,44 @@ export async function handleUpdate(u) {
           await audit('server_start', ctx.actor, {}); return show({ text: '🟢 <b>Server started</b>', kb: kb([BACK]) });
         }
       }
+      if (ns === 'pa') {                                             // owner only: panel logins
+        if (!owner) return show({ text: '🔒 Owner only.', kb: kb([BACK]) });
+        if (act === 'l') { await PA.load(); return show(await views.pa()); }
+        if (act === 'add') {
+          await PA.load(); if (PA.list().length >= MAX_PANEL_LOGINS) return show({ text: `❌ Limit reached (${MAX_PANEL_LOGINS}). Delete one first.`, kb: kb([[['🔑 Panel logins', 'pa:l']]]) });
+          await state.set(chatId, { mode: 'pa_email' });
+          return show({ text: '🔑 <b>Add panel login 1/3</b>\nSend the <b>email</b> for the new admin login (any email; it is only used to log in to the panel).\n/cancel to abort.', kb: kb([[['✖ Cancel', 'pa:l']]]) });
+        }
+        if (act === 'gp') {
+          const st = await state.get(chatId); if (!st || st.mode !== 'pa_pw') return show({ text: 'Expired. Start again.', kb: kb([[['🔑 Panel logins', 'pa:l']]]) });
+          const pw = genPw(), h = await hashSecret(pw);
+          await state.set(chatId, { mode: 'pa_pin', email: st.email, salt: h.salt, pw: h.hash });
+          await say(`🎲 <b>Generated password</b> for <code>${esc(st.email)}</code>\n<code>${esc(pw)}</code>\n\nSave it in your password manager now — I cannot show it again. Then delete this message.`);
+          return show(paPinPrompt(st.email));
+        }
+        if (act === 'gn') {
+          const st = await state.get(chatId); if (!st || st.mode !== 'pa_pin') return show({ text: 'Expired. Start again.', kb: kb([[['🔑 Panel logins', 'pa:l']]]) });
+          const pin = genPin(), h = await hashSecret(pin);
+          await state.set(chatId, { mode: 'pa_c', email: st.email, salt: st.salt, pw: st.pw, pinSalt: h.salt, pin: h.hash });
+          await say(`🎲 <b>Generated PIN</b> for <code>${esc(st.email)}</code>\n<code>${esc(pin)}</code>\n\nSave it now — I cannot show it again. Then delete this message.`);
+          return show(paConfirm(st.email, 1));
+        }
+        if (act === 'ok') {
+          const st = await state.get(chatId), n = Number(rest[0]); if (!st || st.mode !== 'pa_c') return show({ text: 'Expired. Start again.', kb: kb([[['🔑 Panel logins', 'pa:l']]]) });
+          if (n < 9) return show(paConfirm(st.email, n));
+          const total = await PA.add({ email: st.email, salt: st.salt, pw: st.pw, pinSalt: st.pinSalt, pin: st.pin }, ctx.actor);
+          await state.clear(chatId); await audit('panel_login_add', ctx.actor, { email: st.email });
+          return show({ text: `✅ Panel login added: <code>${esc(st.email)}</code>\nTotal: ${total}/${MAX_PANEL_LOGINS}\n\nThey can log in to the admin panel now with this email + password + PIN.`, kb: kb([[['🔑 Panel logins', 'pa:l']], BACK]) });
+        }
+        if (act === 'd') {
+          const sid = rest[0], n = Number(rest[1]), a = PA.list().find((x) => x.sid === sid);
+          if (!a) return show({ text: 'Not found (already deleted?).', kb: kb([[['🔑 Panel logins', 'pa:l']]]) });
+          if (n < 9) return show(ladder({ n, total: 2, title: `🗑 Delete panel login <code>${esc(a.email)}</code>?`, body: n === 1 ? 'This admin is logged out immediately and cannot log in again.' : 'Final check — delete this login?', next: n === 1 ? `pa:d:${sid}:2` : `pa:d:${sid}:9`, cancel: 'pa:l' }));
+          const email = await PA.remove(sid); await audit('panel_login_delete', ctx.actor, { email });
+          return show({ text: `🗑 Deleted panel login <code>${esc(email)}</code>`, kb: kb([[['🔑 Panel logins', 'pa:l']], BACK]) });
+        }
+        return;
+      }
       if (ns === 'adm') {                                            // owner only
         if (!owner) return show({ text: '🔒 Owner only.', kb: kb([BACK]) });
         const syncChat = async (ids) => { try { await callInternal(env('CHAT_BASE_URL'), '/internal/admins-set', { ids }); } catch (e) { console.warn('chat admins', e.message); } };
@@ -250,6 +305,25 @@ export async function handleUpdate(u) {
       const st = await state.get(chatId);
       if (st?.mode === 'find') { const docs = await D.findUsers(text); if (!docs.length) return say('❌ No user found. Try gmail / phone / player ID / FF UID. /cancel to stop.'); if (docs.length > 1) return say('Several users matched:', kb([...docs.map((d) => [[`${d.data().appName} • ${d.data().email}`.slice(0, 50), `uc:${d.id}`]]), BACK])); return show(await afterFind(docs[0].id, st, ctx)); }
       if (st?.mode === 'dom_add') return show(await dom.onText(text, ctx));
+      if (st?.mode === 'pa_email') {
+        if (!owner) return;
+        const em = text.toLowerCase(); if (!PA_EMAIL.test(em)) return say('❌ Send a valid email. /cancel to stop.');
+        await PA.load(); if (envAccounts().some((a) => a.email === em) || PA.list().some((a) => a.email === em)) return say('❌ This email already has a panel login.');
+        await state.set(chatId, { mode: 'pa_pw', email: em }); return show(paPwPrompt(em));
+      }
+      if (st?.mode === 'pa_pw' || st?.mode === 'pa_pin') {
+        if (!owner) return;
+        const gone = await tg.call('deleteMessage', { chat_id: chatId, message_id: msg.message_id }).catch(() => ({}));   // remove the secret from the chat
+        const warn = gone.ok ? '' : '\n⚠️ I could not delete your message — please delete it yourself.';
+        if (st.mode === 'pa_pw') {
+          if (text.length < 12 || text.length > 128) return say('❌ Password must be 12–128 characters. Try again.' + warn);
+          const h = await hashSecret(text); await state.set(chatId, { mode: 'pa_pin', email: st.email, salt: h.salt, pw: h.hash });
+          return say('✅ Password saved (hidden).' + warn).then(() => show(paPinPrompt(st.email)));
+        }
+        if (!/^\d{6,12}$/.test(text)) return say('❌ PIN must be 6–12 digits. Try again.' + warn);
+        const h = await hashSecret(text); await state.set(chatId, { mode: 'pa_c', email: st.email, salt: st.salt, pw: st.pw, pinSalt: h.salt, pin: h.hash });
+        return say('✅ PIN saved (hidden).' + warn).then(() => show(paConfirm(st.email, 1)));
+      }
       if (st?.mode === 'adm_add') { if (!owner) return; if (!/^\d{5,15}$/.test(text)) return say('❌ Send only the numeric Telegram ID.'); await state.set(chatId, { mode: 'adm_add_c', id: text }); return show(ladder({ n: 1, total: 2, title: `Add admin <code>${esc(text)}</code>?`, body: 'Admins can manage users, data and withdrawals (not other admins).', next: 'adm:ad:2', danger: false })); }
       if (st?.mode === 'file') return say('Please send the backup <b>file</b> (not text). /cancel to abort.');
       return show(await home());
@@ -265,6 +339,7 @@ export async function handleUpdate(u) {
       if (!['dep', 'wd'].includes(t) || !amt) return say('Usage: <code>/addbal UID dep|wd AMOUNT</code>');
       return show(ladder({ n: 1, total: 2, title: `${amt > 0 ? 'ADD' : 'CUT'} ₹${Math.abs(amt)} ${t === 'dep' ? 'deposit' : 'withdraw'} balance of <code>${esc(uid)}</code>?`, next: `bal:2:${uid}:${t === 'dep' ? 'd' : 'w'}:${amt}`, danger: false }));
     }
+    if (cmd === '/unlockadmin' && args[0]) { if (!owner) return say('⛔ Owner only.'); const em = args[0].trim().toLowerCase(); await guard.unlockEmail('admin:' + em); await audit('admin_unlock', ctx.actor, { email: em }); return say(`✅ Admin login unlocked: <code>${esc(em)}</code>`); }
     if (cmd === '/unblock' && args[0]) { await guard.unblock(args[0]); return say(`✅ Unblocked <code>${esc(args[0])}</code>`); }
     if (cmd === '/block' && args[0]) { await guard.block(args[0], (Number(args[1]) || 24) * 3600, 'manual'); return say(`🚫 Blocked <code>${esc(args[0])}</code> for ${Number(args[1]) || 24}h`); }
     return say('Use /start for the menu.');
