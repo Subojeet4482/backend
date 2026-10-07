@@ -3,7 +3,7 @@ import zlib from 'node:zlib';
 import { promisify } from 'node:util';
 import { tg, cfg, guard, roles, state, logs } from './svc.js';
 import { db } from './fb.js';
-import { esc, kb, ladder } from './tg.js';
+import { esc, kb, ladder, showIdToStrangers } from './tg.js';
 import { env, HttpError } from './base.js';
 import { callInternal } from './internal.js';
 import { makeDomainUI } from './domreq.js';
@@ -57,7 +57,7 @@ export async function handleUpdate(u) {
   if (!(await roles.isAdmin(from.id))) {
     console.warn('[tg:chat] NOT ADMIN', from.id, from.username || '', JSON.stringify(dbgText));
     const cid = (msg?.chat || cb?.message?.chat)?.id;
-    if (cid) await tg.send(cid, `⛔ <b>Access denied</b>\nYou are not an admin of this bot.\nYour Telegram ID: <code>${from.id}</code>`).catch(() => {});
+    if (cid && showIdToStrangers()) await tg.send(cid, `⛔ <b>Access denied</b>\nYou are not an admin of this bot.\nYour Telegram ID: <code>${from.id}</code>`).catch(() => {});
     return;
   }
   try { if (u.update_id && !(await state.claim('cupd' + u.update_id))) { console.log('[tg:chat] duplicate update skipped', u.update_id); return; } }
