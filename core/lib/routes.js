@@ -3,6 +3,7 @@ import { getAuth } from 'firebase-admin/auth';
 import { svc, guard, logs, tg, roles, notifyAdmins, cfg } from './svc.js';
 import { db, mainApp } from './fb.js';
 import { env, HttpError } from './base.js';
+import * as store from './store.js';
 import { callInternal } from './internal.js';
 import { esc, kb, webhookOk } from './tg.js';
 import { listReqs } from './domreq.js';
@@ -23,6 +24,14 @@ async function idp(endpoint, payload) {
   const j = await r.json().catch(() => ({}));
   if (!r.ok) { const m = j?.error?.message || 'UNKNOWN'; const e = new Error(m); e.code = m.split(' ')[0]; throw e; }
   return j;
+}
+
+
+// Sends the verify-email mail. Cooldown 60s per user (memory). Returns 'sent' | 'wait' | 'error'.
+async function sendVerify(uid, idToken) {
+  if (!(await store.once('ff:vmail:' + uid, 60))) return 'wait';
+  try { await idp('accounts:sendOobCode', { requestType: 'VERIFY_EMAIL', idToken }); return 'sent'; }
+  catch (e) { console.warn('verify mail failed:', e.message); await store.del('ff:vmail:' + uid); return 'error'; }
 }
 
 async function ensureProfile(uid, email, hint = {}) {
@@ -49,17 +58,22 @@ export function registerAll() {
     if (!EMAIL_RE.test(email)) throw new HttpError(400, 'bad_email', 'Enter a valid email');
     if (password.length < 8 || password.length > 128) throw new HttpError(400, 'weak_password', 'Password must be at least 8 characters');
     if (phone && phone.length !== 10) throw new HttpError(400, 'bad_phone', 'Enter a valid 10 digit phone');
-    let r;
+    let r, again = false;
     try { r = await idp('accounts:signUp', { email, password, returnSecureToken: true }); }
     catch (e) {
-      if (e.code === 'EMAIL_EXISTS') throw new HttpError(409, 'email_exists', 'Email already registered');
       if (e.code === 'WEAK_PASSWORD') throw new HttpError(400, 'weak_password', 'Password too weak');
-      throw new HttpError(502, 'auth_unavailable', 'Registration unavailable');
+      if (e.code !== 'EMAIL_EXISTS') throw new HttpError(502, 'auth_unavailable', 'Registration unavailable (' + e.code + ')');
+      // Email already in Firebase. If it was never verified and the password matches, just send the link again (user is stuck otherwise).
+      try { r = await idp('accounts:signInWithPassword', { email, password, returnSecureToken: true }); again = true; }
+      catch { throw new HttpError(409, 'email_exists', 'This email is already registered. Please login (or use Forgot password).'); }
+      const look = await idp('accounts:lookup', { idToken: r.idToken }).catch(() => ({}));
+      if (look.users?.[0]?.emailVerified) throw new HttpError(409, 'email_exists', 'This email is already registered. Please login.');
     }
-    await idp('accounts:sendOobCode', { requestType: 'VERIFY_EMAIL', idToken: r.idToken }).catch((e) => console.warn('verify mail', e.message));
+    const mail = await sendVerify(r.localId, r.idToken);
+    if (mail === 'error') throw new HttpError(502, 'mail_failed', 'Account created but the verification email could not be sent. Tap Register again in a minute to resend.');
     await db.main().collection('pending_profiles').doc(r.localId).set({ name, phone, email, at: Date.now(), ip: ctx.ip });
-    await logs.ipLog('register', { uid: r.localId, ip: ctx.ip, ua: ctx.ua, email });
-    return { uid: r.localId, message: 'Verification email sent' };
+    await logs.ipLog('register', { uid: r.localId, ip: ctx.ip, ua: ctx.ua, email, resend: again });
+    return { uid: r.localId, message: mail === 'wait' ? 'Verification link was sent a moment ago. Check your inbox and Spam.' : 'Verification email sent' };
   });
 
   svc.add('POST', '/auth/login', { rl: [20, 60] }, async (ctx) => {
@@ -83,7 +97,10 @@ export function registerAll() {
       console.error('login idp', e.message); throw new HttpError(502, 'auth_unavailable', 'Login unavailable');
     }
     const look = await idp('accounts:lookup', { idToken: r.idToken });
-    if (!look.users?.[0]?.emailVerified) throw new HttpError(403, 'email_not_verified', 'Verify your email first (check Spam too)');
+    if (!look.users?.[0]?.emailVerified) {
+      const mail = await sendVerify(r.localId, r.idToken);
+      throw new HttpError(403, 'email_not_verified', mail === 'sent' ? 'Email not verified. We just sent a new verification link - open it, then login again (check Spam too).' : mail === 'wait' ? 'Email not verified. A verification link was sent a moment ago - check your inbox and Spam.' : 'Email not verified and the verification mail could not be sent. Try again in a minute.');
+    }
     const u = await ensureProfile(r.localId, email);
     if (W.isBanned(u)) throw new HttpError(403, 'banned', 'Your account is banned');
     await guard.loginOk(ctx.ip, email);
