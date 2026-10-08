@@ -143,8 +143,12 @@ export function registerAll() {
   // ---------- READ (replaces heavy onSnapshot listeners) ----------
   svc.add('GET', '/me', { auth: 'user', rl: [60, 60] }, async (ctx) => {
     const s = await db.main().collection('users').doc(ctx.user.uid).get();
-    if (!s.exists) throw new HttpError(404, 'no_user', 'Profile missing');
-    return { user: s.data() };
+    if (s.exists) return { user: s.data() };
+    // first login after email verification: create the profile here (login itself happens directly on Firebase in the panel)
+    const em = String(ctx.user.email || '').toLowerCase();
+    if (!EMAIL_RE.test(em)) throw new HttpError(404, 'no_user', 'Profile missing');
+    if (ctx.user.email_verified === false) throw new HttpError(403, 'email_not_verified', 'Email not verified. Open the verification link first.');
+    return { user: await ensureProfile(ctx.user.uid, em, { name: ctx.user.name, photoUrl: ctx.user.picture }) };
   });
   svc.add('GET', '/matches', { auth: 'user', rl: [30, 60] }, async () => ({
     matches: await cached('matches', 15000, async () => (await db.main().collection('matches').limit(100).get()).docs.map((x) => {
