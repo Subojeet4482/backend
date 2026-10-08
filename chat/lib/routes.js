@@ -1,5 +1,6 @@
 import { FieldValue } from 'firebase-admin/firestore';
-import { svc, tg, logs, cfg, roles } from './svc.js';
+import { svc, tg, logs, cfg, roles, notifyAdmins } from './svc.js';
+import { registerSocial } from './social.js';
 import { db } from './fb.js';
 import { env, HttpError, sha } from './base.js';
 import * as store from './store.js';
@@ -31,6 +32,9 @@ async function latest() {
 }
 
 export function registerAll() {
+  // friends, DMs, groups, presence, reactions, reports, discover (see social.js)
+  const S = registerSocial(svc, { getProfile, invalidateProfile, invalidateLatest, prof: mem.prof, coreBanned, notifyAdmins });
+
   // ---------- WORLD CHAT (polling, 1 shared read per 2s per instance) ----------
   svc.add('GET', '/world/messages', { auth: 'user', rl: [60, 60] }, async (ctx) => {
     const after = Number(ctx.query.after) || 0, list = await latest();
@@ -43,8 +47,7 @@ export function registerAll() {
     if (!c.worldEnabled) throw new HttpError(503, 'chat_off', 'World chat is paused');
     const text = String(ctx.body.text || '').replace(/[ \t]+/g, ' ').trim();
     if (!text || text.length > c.msgMaxLen) throw new HttpError(400, 'bad_text', `Message must be 1-${c.msgMaxLen} characters`);
-    const p = await getProfile(uid);
-    if (!p) throw new HttpError(409, 'no_profile', 'Profile not ready. Login again.');
+    const p = (await getProfile(uid)) || (await S.ensureProfile(uid));
     if (p.banned || (await coreBanned(uid))) throw new HttpError(403, 'banned', 'Account restricted');
     if (Number(p.chatBanUntil) > Date.now()) throw new HttpError(403, 'chat_banned', 'You are muted in chat', { until: p.chatBanUntil });
     const low = text.toLowerCase();
@@ -53,7 +56,8 @@ export function registerAll() {
     if ((await store.incr('ff:cd:' + uid, c.cooldownSec || 2)) > 1) throw new HttpError(429, 'slow_down', 'Wait a moment before sending again');
     const h = sha(low); if ((await store.get('ff:last:' + uid)) === h) throw new HttpError(400, 'duplicate', 'Duplicate message');
     await store.set('ff:last:' + uid, h, 15);
-    const doc = { uid, name: p.appName || 'Player', username: p.username || '', photoUrl: p.photoUrl || '', text, createdAt: Date.now() };
+    const doc = { uid, name: p.appName || 'Player', username: p.username || '', text, createdAt: Date.now() };
+    if (ctx.body.replyTo && typeof ctx.body.replyTo === 'object') doc.replyTo = { mid: String(ctx.body.replyTo.mid || '').slice(0, 60), text: String(ctx.body.replyTo.text || '').slice(0, 120) };
     const ref = await db.chat().collection('world_messages').add(doc);
     invalidateLatest();
     return { message: { id: ref.id, ...doc } };
@@ -67,17 +71,28 @@ export function registerAll() {
 
   // ---------- PROFILE ----------
   svc.add('GET', '/profile/:uid', { auth: 'user', rl: [60, 60] }, async (ctx) => {
-    const uid = ctx.params.uid === 'me' ? ctx.user.uid : ctx.params.uid, p = await getProfile(uid);
+    const me = ctx.user.uid, uid = ctx.params.uid === 'me' ? me : ctx.params.uid;
+    let p = await getProfile(uid);
+    if (!p && uid === me) p = await S.ensureProfile(me);
     if (!p || p.banned) throw new HttpError(404, 'not_found', 'Profile not found');
-    return { profile: uid === ctx.user.uid ? { ...pub(p), privacy: p.privacy || 'public', usernameChangesLeft: p.usernameChangesLeft ?? 3 } : pub(p) };
+    if (uid === me) { p = await S.ensureUsername(me, p); return { profile: { ...pub(p), privacy: p.privacy || 'public', usernameChangesLeft: p.usernameChangesLeft ?? 3 } }; }
+    const [mine, theirs] = await Promise.all([S.getSocial(me), S.getSocial(uid)]);
+    if (theirs.blocked.includes(me)) throw new HttpError(404, 'not_found', 'Profile not found');
+    const friend = mine.friends.includes(uid), locked = (p.privacy || 'public') === 'private' && !friend;
+    const base = locked ? { uid, appName: p.appName || 'Player', username: p.username || '', photoUrl: p.photoUrl || '', privacy: 'private' } : { ...pub(p), privacy: p.privacy || 'public' };
+    return { profile: { ...base, locked, isFriend: friend, requested: mine.outgoing.includes(uid), incomingRequest: theirs.outgoing.includes(me), blockedByMe: mine.blocked.includes(uid), friendCount: locked ? 0 : theirs.friends.length, ...(locked ? { online: false, lastSeen: 0 } : S.live(p, uid, true)) } };
   });
-  svc.add('PUT', '/profile', { auth: 'user', rl: [10, 60] }, async (ctx) => {
+  svc.add('PUT', '/profile', { auth: 'user', rl: [10, 60], maxBody: 300000 }, async (ctx) => {
     const b = ctx.body, patch = {};
     if (b.bio !== undefined) { const bio = String(b.bio).trim(); if (bio.length > 120) throw new HttpError(400, 'bad_bio', 'Bio max 120 characters'); patch.bio = bio; }
     if (b.privacy !== undefined) { if (!['public', 'friends', 'private'].includes(b.privacy)) throw new HttpError(400, 'bad_privacy', 'Invalid privacy'); patch.privacy = b.privacy; }
-    for (const k of ['photoUrl', 'coverURL']) if (b[k] !== undefined) { const v = String(b[k]); if (v && !/^https:\/\/[^\s]{5,480}$/.test(v)) throw new HttpError(400, 'bad_url', 'Invalid image URL'); patch[k] = v; }
+    for (const k of ['photoUrl', 'coverURL']) if (b[k] !== undefined) {
+      const v = String(b[k]), lim = k === 'photoUrl' ? 60000 : 200000;
+      if (v && !/^data:image\/(jpeg|png|webp);base64,[A-Za-z0-9+/=]+$/.test(v) && !/^https:\/\/[^\s]{5,480}$/.test(v)) throw new HttpError(400, 'bad_url', 'Invalid image');
+      if (v.length > lim) throw new HttpError(400, 'image_big', 'Image too large'); patch[k] = v;
+    }
     if (!Object.keys(patch).length) throw new HttpError(400, 'nothing', 'Nothing to update');
-    await db.chat().collection('profiles').doc(ctx.user.uid).update(patch); invalidateProfile(ctx.user.uid);
+    await db.chat().collection('profiles').doc(ctx.user.uid).set(patch, { merge: true }); invalidateProfile(ctx.user.uid);
     return { updated: Object.keys(patch) };
   });
   svc.add('POST', '/profile/username', { auth: 'user', rl: [5, 3600] }, async (ctx) => {
@@ -97,13 +112,15 @@ export function registerAll() {
     invalidateProfile(ctx.user.uid); return { username: un };
   });
   svc.add('GET', '/search', { auth: 'user', rl: [20, 60] }, async (ctx) => {
-    const q = String(ctx.query.q || '').trim().toLowerCase();
+    const q = String(ctx.query.q || '').trim().toLowerCase().replace(/^@/, '');
     if (!/^[a-z0-9_.]{2,20}$/.test(q)) throw new HttpError(400, 'bad_query', 'Type at least 2 characters (a-z, 0-9, _ .)');
-    const c = mem.search.get(q); if (c && Date.now() - c.t < 20000) return { users: c.v };
-    const s = await db.chat().collection('profiles').where('usernameLower', '>=', q).where('usernameLower', '<=', q + '\uf8ff').limit(15).get();
-    const v = s.docs.map((x) => x.data()).filter((p) => !p.banned).map(pub); mem.search.set(q, { v, t: Date.now() }); return { users: v };
+    const c = mem.search.get(q); if (c && Date.now() - c.t < 20000) return { users: c.v.filter((u) => u.uid !== ctx.user.uid) };
+    const col = db.chat().collection('profiles'), by = (f) => col.where(f, '>=', q).where(f, '<=', q + '\uf8ff').limit(15).get();
+    const [a1, a2] = await Promise.all([by('usernameLower'), by('nameKey')]), seen = new Set(), v = [];
+    for (const x of [...a1.docs, ...a2.docs]) { const p = x.data(); if (p.banned || seen.has(p.uid)) continue; seen.add(p.uid); v.push({ ...pub(p), online: (p.privacy || 'public') === 'public' && S.isOn(p.uid) }); }
+    mem.search.set(q, { v: v.slice(0, 20), t: Date.now() }); if (mem.search.size > 500) mem.search.clear();
+    return { users: v.slice(0, 20).filter((u) => u.uid !== ctx.user.uid) };
   });
-
 
   // ---------- ADMIN (admin panel -> chat moderation). Firebase login token + ADMIN_EMAILS ----------
   const adm = (method, path, fn, rl = [90, 60]) => svc.add(method, path, { auth: 'admin', rl }, fn);
@@ -143,7 +160,11 @@ export function registerAll() {
   svc.add('POST', '/internal/profile-init', { auth: 'internal' }, async (ctx) => {
     const uid = String(ctx.body.uid || ''); if (!uid) throw new HttpError(400, 'bad_input', 'uid required');
     const ref = db.chat().collection('profiles').doc(uid);
-    if (!(await ref.get()).exists) await ref.set({ uid, appName: String(ctx.body.appName || 'Player').slice(0, 30), username: '', usernameLower: '', bio: '', photoUrl: String(ctx.body.photoUrl || ''), coverURL: '', privacy: 'public', usernameChangesLeft: 3, createdAt: Date.now() });
+    if (!(await ref.get()).exists) await ref.set({ uid, appName: String(ctx.body.appName || 'Player').slice(0, 30), nameKey: String(ctx.body.appName || '').toLowerCase().replace(/[^a-z0-9_.]/g, '').slice(0, 30), username: '', usernameLower: '', bio: '', photoUrl: String(ctx.body.photoUrl || ''), coverURL: '', privacy: 'public', usernameChangesLeft: 3, createdAt: Date.now() });
+  });
+  svc.add('POST', '/internal/profile-sync', { auth: 'internal' }, async (ctx) => {            // core -> chat: display name changed
+    const uid = String(ctx.body.uid || ''), n = String(ctx.body.appName || '').trim().slice(0, 30); if (!uid || n.length < 3) return;
+    await db.chat().collection('profiles').doc(uid).set({ appName: n, nameKey: n.toLowerCase().replace(/[^a-z0-9_.]/g, '') }, { merge: true }); invalidateProfile(uid);
   });
   svc.add('POST', '/internal/user-ban', { auth: 'internal' }, async (ctx) => {
     const uid = String(ctx.body.uid || ''); await db.chat().collection('profiles').doc(uid).set({ banned: !!ctx.body.banned }, { merge: true });
