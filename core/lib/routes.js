@@ -12,6 +12,7 @@ import { LOG_PAGE } from './logpage.js';
 import * as A from './adminapi.js';
 import { adminLoginEnabled, checkAdminCreds, issueAdminToken, isAdminEmail } from './adminauth.js';
 import * as W from './wallet.js';
+import { registerUser } from './userapi.js';
 import { handleUpdate } from './bot.js';
 import { archiveOld, purgeIpLogs, cleanupPending, sendSnapshot } from './backup.js';
 
@@ -24,13 +25,13 @@ async function idp(endpoint, payload) {
   return j;
 }
 
-async function ensureProfile(uid, email) {
+async function ensureProfile(uid, email, hint = {}) {
   const d = db.main(), ref = d.collection('users').doc(uid), s = await ref.get();
   if (s.exists) return s.data();
   const p = (await d.collection('pending_profiles').doc(uid).get()).data() || {};
   let playerId = '';
   for (let i = 0; i < 20; i++) { playerId = String(Math.floor(1000000 + Math.random() * 9000000)); if ((await d.collection('users').where('playerId', '==', playerId).limit(1).get()).empty) break; }
-  const doc = { appName: p.name || email.split('@')[0], email, phone: p.phone || '', balance: 0, depositBalance: 0, withdrawBalance: 0, uid, playerId, joined_matches: [], score: 0, kills: 0, matchesPlayed: 0, matchesWon: 0, totalEarned: 0, gameName: '', gameUid: '', isUidVerified: false, photoUrl: '', nameChangesLeft: 2, createdAt: Date.now() };
+  const doc = { appName: String(p.name || hint.name || email.split('@')[0]).replace(/[<>]/g, '').trim().slice(0, 30).padEnd(3, '_'), email, phone: p.phone || '', balance: 0, depositBalance: 0, withdrawBalance: 0, uid, playerId, joined_matches: [], score: 0, kills: 0, matchesPlayed: 0, matchesWon: 0, totalEarned: 0, gameName: '', gameUid: '', isUidVerified: false, photoUrl: /^https:\/\/\S{5,480}$/.test(hint.photoUrl || '') ? hint.photoUrl : '', nameChangesLeft: 2, createdAt: Date.now() };
   await ref.set(doc); await d.collection('pending_profiles').doc(uid).delete().catch(() => {});
   try { await callInternal(env('CHAT_BASE_URL'), '/internal/profile-init', { uid, appName: doc.appName, photoUrl: '' }); } catch (e) { console.warn('chat profile-init', e.message); }
   return doc;
@@ -96,6 +97,30 @@ export function registerAll() {
     if (EMAIL_RE.test(email)) await idp('accounts:sendOobCode', { requestType: 'PASSWORD_RESET', email }).catch(() => {});
     await logs.ipLog('forgot', { ip: ctx.ip, ua: ctx.ua, email });
     return { message: 'If this email exists, a reset link was sent.' };
+  });
+
+
+  // Google sign-in: the app gets a Google access token (Google Identity Services popup) and sends it here.
+  // We exchange it with Firebase Auth (signInWithIdp), create the profile on first login, and hand back a custom token like /auth/login does.
+  svc.add('POST', '/auth/google', { rl: [20, 60] }, async (ctx) => {
+    const at = String(ctx.body.accessToken || '').trim();
+    if (at.length < 20 || at.length > 4096 || /[\s&=]/.test(at)) throw new HttpError(400, 'bad_input', 'Google sign-in failed. Try again.');
+    let r;
+    try { r = await idp('accounts:signInWithIdp', { postBody: `access_token=${encodeURIComponent(at)}&providerId=google.com`, requestUri: env('FIREBASE_REFERER') || String(ctx.req.headers.origin || 'http://localhost'), returnIdpCredential: true, returnSecureToken: true }); }
+    catch (e) {
+      if (e.code === 'USER_DISABLED') throw new HttpError(403, 'disabled', 'Account disabled');
+      if (/INVALID_IDP_RESPONSE|INVALID_CREDENTIAL/.test(e.message)) throw new HttpError(401, 'google_invalid', 'Google sign-in expired. Try again.');
+      if (/OPERATION_NOT_ALLOWED/.test(e.message)) throw new HttpError(503, 'google_off', 'Google sign-in is not enabled for this app yet.');
+      console.error('google idp', e.message); throw new HttpError(502, 'auth_unavailable', 'Google sign-in unavailable');
+    }
+    if (r.needConfirmation || !r.localId) throw new HttpError(409, 'use_password', 'This email already has a password account. Login with email & password.');
+    const email = String(r.email || '').toLowerCase();
+    if (!EMAIL_RE.test(email) || r.emailVerified === false) throw new HttpError(403, 'email_not_verified', 'Your Google email is not verified');
+    const u = await ensureProfile(r.localId, email, { name: r.displayName || r.fullName, photoUrl: r.photoUrl });
+    if (W.isBanned(u)) throw new HttpError(403, 'banned', 'Your account is banned');
+    await logs.ipLog('login_google', { uid: r.localId, ip: ctx.ip, ua: ctx.ua });
+    const customToken = await getAuth(mainApp()).createCustomToken(r.localId);
+    return { customToken, uid: r.localId, isNew: !!r.isNewUser };
   });
 
   // ---------- READ (replaces heavy onSnapshot listeners) ----------
@@ -193,7 +218,7 @@ export function registerAll() {
   svc.add('POST', '/internal/user-status', { auth: 'internal' }, async (ctx) => {
     const s = await db.main().collection('users').doc(String(ctx.body.uid)).get();
     if (!s.exists) return { exists: false, banned: true };
-    const u = s.data(); return { exists: true, banned: W.isBanned(u), appName: u.appName || '', photoUrl: u.photoUrl || '' };
+    const u = s.data(); return { exists: true, banned: W.isBanned(u), appName: u.appName || '', photoUrl: u.photoUrl || '', isVerified: !!u.isVerified };
   });
 
   // ---------- TELEGRAM + CRON ----------
@@ -211,6 +236,7 @@ export function registerAll() {
 
   // ---------- ADMIN API v2 (panel: matches, users, ban, balance, deposits) ----------
   A.registerAdmin(svc, logs, { roles, tg });
+  registerUser(svc, { notifyAdmins, logs, verifyPassword: (email, password) => idp('accounts:signInWithPassword', { email, password, returnSecureToken: false }) });
 
   // ---------- INTERNAL: stop/start + admins sync come from the chat side too ----------
   svc.add('POST', '/internal/set-stopped', { auth: 'internal' }, async (ctx) => { await cfg.set({ stopped: !!ctx.body.stopped }); });
