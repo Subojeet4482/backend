@@ -122,7 +122,7 @@ export function createService({ name, cfg, guard, verifyToken, onEvent }) {
       }
       if (!internalish) {
         if (await guard.isBlocked(ip)) { event('ip_blocked_hit', { ip, path: url.pathname }); throw tagged('blocked'); }
-        if (await limit('ff:g:' + ip, c.globalLimit || 120, 60)) { event('rate_limited', { ip, path: url.pathname }); throw tagged('rate', { retryAfter: 60 }); }
+        if (await limit('ff:g:' + ip, c.globalLimit || 600, 60)) { event('rate_limited', { ip, path: url.pathname }); throw tagged('rate', { retryAfter: 60 }); }
         if (c.maintenance && o.auth !== 'admin' && !o.always) throw tagged('maintenance');
       }
       if (Number(req.headers['content-length'] || 0) > (o.maxBody || 20000)) throw new HttpError(413, 'too_large', 'Request too large');
