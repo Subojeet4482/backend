@@ -248,10 +248,16 @@ export function registerAll() {
     try { await handleUpdate(ctx.body); } catch (e) { console.error('tg', e); }
   });
   svc.add('GET', '/cron/daily', { auth: 'cron' }, async () => {
-    const a = await archiveOld({}), p = await purgeIpLogs(), u = await cleanupPending(); let mr = {}; try { mr = await A.monthlyReward(); } catch (e) { console.error('monthly reward', e); }
-    await purgeExpired(() => db.main());
-    await notifyAdmins(`🗄 <b>Daily job</b>\nArchived tx: ${a.archived}\nIP logs purged: ${p}\nUnverified accounts removed: ${u}${mr.rewarded ? `\nMonthly rewards: ${mr.rewarded}` : ''}`);
-    return { archived: a.archived, purged: p, unverified: u };
+    // FIX: every step is isolated. Before, ONE failing step (e.g. archiveOld needing a collection-group index) aborted the whole job,
+    // so the IP-log purge, unverified cleanup and the MONTHLY LEADERBOARD REWARDS never ran, and the job was retried 4x and then dropped.
+    const errs = [], step = async (name, fn, dflt) => { try { return await fn(); } catch (e) { console.error('[cron/daily]', name, e); errs.push(`${name}: ${String((e && e.message) || e).slice(0, 120)}`); return dflt; } };
+    const a = await step('archiveOld', () => archiveOld({}), { archived: 0 });
+    const p = await step('purgeIpLogs', () => purgeIpLogs(), 0);
+    const u = await step('cleanupPending', () => cleanupPending(), 0);
+    const mr = await step('monthlyReward', () => A.monthlyReward(), {});
+    await step('purgeExpired', () => purgeExpired(() => db.main()));
+    await step('notify', () => notifyAdmins(`🗄 <b>Daily job</b>\nArchived tx: ${a.archived}\nIP logs purged: ${p}\nUnverified accounts removed: ${u}${mr.rewarded ? `\nMonthly rewards: ${mr.rewarded}` : ''}${errs.length ? `\n⚠️ Failed steps:\n${errs.join('\n').replace(/[<>&]/g, '')}` : ''}`));
+    return { archived: a.archived, purged: p, unverified: u, errors: errs };
   });
   svc.add('GET', '/cron/weekly', { auth: 'cron' }, async () => ({ sent: await sendSnapshot(tg, await roles.recipients()) }));
 
