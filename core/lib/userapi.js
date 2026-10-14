@@ -4,6 +4,7 @@ import { db } from './fb.js';
 import { HttpError, env, r2 } from './base.js';
 import { callInternal } from './internal.js';
 import * as store from './store.js';
+const BAD_TEXT = /[<>\u0000-\u001f]/;   // markup / control characters are never valid in display names
 import { isBanned, depBal } from './wallet.js';
 
 const PUBLIC_CFG = ['banners', 'url', 'upi', 'qrUrl', 'cryptoCoin', 'cryptoAddr', 'supportNumber', 'whatsappName', 'whatsappLink', 'whatsappNumber', 'telegramName', 'telegramLink', 'telegramChannel', 'notice'];
@@ -51,9 +52,10 @@ export function registerUser(svc, { notifyAdmins, logs, verifyPassword }) {
       const u = s.data(), patch = {};
       if (b.appName !== undefined) {
         const n = String(b.appName).trim(); if (n.length < 3 || n.length > 30) throw new HttpError(400, 'bad_name', 'App name must be 3-30 characters');
+        if (BAD_TEXT.test(n)) throw new HttpError(400, 'bad_name', 'App name cannot contain < > or control characters');   // FIX: stored XSS (name is shown to every user on the leaderboard)
         if (n !== u.appName) { const left = u.nameChangesLeft ?? 2; if (left <= 0) throw new HttpError(403, 'name_limit', 'Name change limit reached'); patch.appName = n; patch.nameChangesLeft = left - 1; }
       }
-      if (b.gameName !== undefined) { const n = String(b.gameName).trim(); if (n.length < 3 || n.length > 30) throw new HttpError(400, 'bad_name', 'Game name must be 3-30 characters'); patch.gameName = n; }
+      if (b.gameName !== undefined) { const n = String(b.gameName).trim(); if (n.length < 3 || n.length > 30) throw new HttpError(400, 'bad_name', 'Game name must be 3-30 characters'); if (BAD_TEXT.test(n)) throw new HttpError(400, 'bad_name', 'Game name cannot contain < > or control characters'); patch.gameName = n; }
       if (b.gameUid !== undefined) {
         const g = String(b.gameUid).trim(); if (!/^\d{6,12}$/.test(g)) throw new HttpError(400, 'bad_uid', 'FF UID invalid (6-12 digits)');
         if (u.isUidVerified && g !== String(u.gameUid || '')) throw new HttpError(403, 'uid_locked', 'Verified UID cannot be changed');
@@ -61,7 +63,7 @@ export function registerUser(svc, { notifyAdmins, logs, verifyPassword }) {
       }
       if (b.photoUrl !== undefined) {
         const p = String(b.photoUrl);
-        if (p && !/^data:image\/(jpeg|png|webp);base64,[A-Za-z0-9+/=]+$/.test(p) && !/^https:\/\/\S{5,480}$/.test(p)) throw new HttpError(400, 'bad_photo', 'Invalid image');
+        if (p && !/^data:image\/(jpeg|png|webp);base64,[A-Za-z0-9+/=]+$/.test(p) && !/^https:\/\/[^\s"'<>\\`]{5,480}$/.test(p)) throw new HttpError(400, 'bad_photo', 'Invalid image');
         if (p.length > 120000) throw new HttpError(400, 'photo_big', 'Image too large'); patch.photoUrl = p;
       }
       if (b.paymentMethod !== undefined) { patch.paymentMethod = String(b.paymentMethod).slice(0, 60); patch.paymentName = String(b.paymentName || '').slice(0, 60); }
