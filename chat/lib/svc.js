@@ -8,7 +8,7 @@ import { makeState } from './state.js';
 import { db, verifyIdToken } from './fb.js';
 import { env } from './base.js';
 
-export const DEFAULTS = { allowedOrigins: [], deniedOrigins: [], stopped: false, maintenance: false, globalLimit: 120, worldEnabled: true, msgMaxLen: 300, blockLinks: true, badWords: [], retentionDays: 7, cooldownSec: 2, mediaOn: true, banner: '' };
+export const DEFAULTS = { allowedOrigins: [], deniedOrigins: [], stopped: false, maintenance: false, globalLimit: 600, worldEnabled: true, msgMaxLen: 300, blockLinks: true, badWords: [], retentionDays: 7, cooldownSec: 2, mediaOn: true, banner: '' };
 export const cfg = makeCfg(() => db.chat(), DEFAULTS);
 export const guard = makeGuard(() => db.chat());
 export const logs = makeLogs(() => db.chat());
