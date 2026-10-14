@@ -10,7 +10,7 @@ import { db, verifyIdToken } from './fb.js';
 import { env } from './base.js';
 
 export const DEFAULTS = {
-  allowedOrigins: [], deniedOrigins: [], maintenance: false, stopped: false, globalLimit: 120,
+  allowedOrigins: [], deniedOrigins: [], maintenance: false, stopped: false, globalLimit: 600,
   loginIpMax: 5, loginBlockHours: 24, loginEmailMax: 10, loginEmailLockMin: 30,
   withdrawEnabled: true, depositEnabled: true, joinEnabled: true,
   withdrawMin: 20, withdrawMax: 10000, withdrawFee: 2, depositMin: 10, depositMax: 50000,
