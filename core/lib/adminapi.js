@@ -156,13 +156,26 @@ export function registerAdmin(svc, logs, { roles, tg }) {
     const d = { ...matchFields(ctx.body, false), joined: 0, status: 'upcoming', participants: [], takenSlots: [], createdAt: Date.now() };
     const r = await M().collection('matches').add(d); await aud(ctx, 'match_create', { id: r.id, title: d.title }); return { id: r.id };
   }, [30, 60]);
-  adm('PUT', '/admin/matches/:id', async (ctx) => { const o = matchFields(ctx.body, true); if (!Object.keys(o).length) throw new HttpError(400, 'nothing', 'Nothing to update'); await M().collection('matches').doc(id(ctx.params.id)).update(o); await aud(ctx, 'match_update', { id: ctx.params.id, fields: Object.keys(o) }); });
+  adm('PUT', '/admin/matches/:id', async (ctx) => {
+    const o = matchFields(ctx.body, true); if (!Object.keys(o).length) throw new HttpError(400, 'nothing', 'Nothing to update');
+    const ref = M().collection('matches').doc(id(ctx.params.id)), s = await ref.get(); if (!s.exists) throw new HttpError(404, 'not_found', 'Match not found');
+    const m = s.data(), joined = num(m.joined);
+    // FIX: cancel refunds the CURRENT fee, so changing it after players paid would refund the wrong amount
+    if (joined > 0 && o.fee !== undefined && num(o.fee) !== num(m.fee)) throw new HttpError(409, 'fee_locked', 'Entry fee cannot be changed after players have joined');
+    if (o.total !== undefined && num(o.total) < joined) throw new HttpError(409, 'total_low', `Total slots cannot be lower than the players already joined (${joined})`);
+    await ref.update(o); await aud(ctx, 'match_update', { id: ctx.params.id, fields: Object.keys(o) });
+  });
   adm('DELETE', '/admin/matches/:id', async (ctx) => {
     const ref = M().collection('matches').doc(id(ctx.params.id)), s = await ref.get(); if (!s.exists) throw new HttpError(404, 'not_found', 'Match not found');
     const m = s.data(); if (num(m.joined) > 0 && !['completed', 'cancelled'].includes(m.status)) throw new HttpError(409, 'has_players', 'Players have joined this match. Cancel it (refund) instead.');
     await ref.delete(); await aud(ctx, 'match_delete', { id: ctx.params.id });
   }, [30, 60]);
-  adm('POST', '/admin/matches/:id/complete', async (ctx) => { await M().collection('matches').doc(id(ctx.params.id)).update({ status: 'completed', winnerName: text(ctx.body.winnerName, 60) || 'N/A' }); await aud(ctx, 'match_complete', { id: ctx.params.id }); });
+  adm('POST', '/admin/matches/:id/complete', async (ctx) => {
+    // FIX: was a blind update(): wrong id -> 500, and a CANCELLED (already refunded) match could be re-opened as 'completed' and then paid a prize (double payout)
+    const ref = M().collection('matches').doc(id(ctx.params.id)), s = await ref.get(); if (!s.exists) throw new HttpError(404, 'not_found', 'Match not found');
+    if (s.data().status === 'cancelled') throw new HttpError(409, 'cancelled', 'Match is cancelled (entry fees were refunded) - it cannot be completed');
+    await ref.update({ status: 'completed', winnerName: text(ctx.body.winnerName, 60) || 'N/A' }); await aud(ctx, 'match_complete', { id: ctx.params.id });
+  });
   adm('POST', '/admin/matches/:id/booya', async (ctx) => {
     const ref = M().collection('matches').doc(id(ctx.params.id)), s = await ref.get(); if (!s.exists) throw new HttpError(404, 'not_found', 'Match not found');
     const ok = new Set((s.data().participants || []).map((p) => p.uid)), players = (Array.isArray(ctx.body.players) ? ctx.body.players : []).filter((p) => ok.has(p.uid)).map((p) => ({ uid: p.uid, name: text(p.name, 40) }));
@@ -212,28 +225,59 @@ export function registerAdmin(svc, logs, { roles, tg }) {
     await aud(ctx, `finance_${action}`, { uid, trxId, ...out }); return out;
   }, [60, 60]);
 
-  // ---------- reports ----------
+  // ---------- reports / groups / DMs ----------
+  // FIX: since v7 the chat service (chat/lib/social.js) keeps reports, groups and DMs in the CHAT Firestore, but these endpoints
+  // still read MAIN -> the panel showed no reports / groups / DMs and resolve/delete/hide hit the wrong database.
+  // We read CHAT first and MAIN only for legacy docs (if both resolve to the same DB the duplicates are removed).
+  const C = () => { try { return db.chat(); } catch { return M(); } };
+  const dbs = () => [C(), M()];
+  const legacySafe = async (fn) => { try { return await fn(); } catch (e) { return null; } };    // an optional/legacy source must never break the screen
+  const pick = async (path) => { for (const d of dbs()) { const ref = d.doc(path), snap = await ref.get(); if (snap.exists) return { d, ref, snap }; } return null; };
+  const uniq = (items, key) => { const seen = new Set(); return items.filter((x) => { const k = key(x); if (seen.has(k)) return false; seen.add(k); return true; }); };
+  const ms = (t) => (t && t.toMillis ? t.toMillis() : t);
   adm('GET', '/admin/reports', async (ctx) => {
-    const st = ['open', 'resolved'].includes(ctx.query.status) ? ctx.query.status : 'open'; let s;
-    try { s = await M().collection('reports').where('status', '==', st).orderBy('createdAt', 'desc').limit(80).get(); } catch (e) { if (e.code !== 9) throw e; s = await M().collection('reports').where('status', '==', st).limit(80).get(); }
-    return { items: s.docs.map((x) => { const v = x.data(), t = v.createdAt; return { id: x.id, ...v, createdAt: t && t.toMillis ? t.toMillis() : t }; }) };
+    const st = ['open', 'resolved'].includes(ctx.query.status) ? ctx.query.status : 'open', items = [];
+    for (const [i, d] of dbs().entries()) {
+      const r = await legacySafe(async () => { try { return await d.collection('reports').where('status', '==', st).orderBy('createdAt', 'desc').limit(80).get(); } catch (e) { if (e.code !== 9) throw e; return await d.collection('reports').where('status', '==', st).limit(80).get(); } });
+      if (r) r.docs.forEach((x) => { const v = x.data(); items.push({ id: x.id, ...v, createdAt: ms(v.createdAt) }); });
+      if (i === 0 && !r) throw new HttpError(500, 'reports_unavailable', 'Could not read reports from the chat database');
+    }
+    return { items: uniq(items, (x) => x.id).sort((a, b) => (Number(b.createdAt) || 0) - (Number(a.createdAt) || 0)).slice(0, 80) };
   });
-  adm('GET', '/admin/reports/open-count', async () => ({ count: await count(M().collection('reports').where('status', '==', 'open')) }));
-  adm('POST', '/admin/reports/resolve', async (ctx) => { await M().collection('reports').doc(id(ctx.body.id)).update({ status: 'resolved', resolvedAt: Date.now() }); await aud(ctx, 'report_resolve', { id: ctx.body.id }); });
+  adm('GET', '/admin/reports/open-count', async () => { let n = 0, any = false; const seen = new Set(); for (const d of dbs()) { const r = await legacySafe(() => d.collection('reports').where('status', '==', 'open').select().limit(500).get()); if (r) { any = true; r.docs.forEach((x) => seen.add(x.id)); } } n = seen.size; return { count: any ? n : null }; });
+  adm('POST', '/admin/reports/resolve', async (ctx) => {
+    const f = await pick('reports/' + id(ctx.body.id)); if (!f) throw new HttpError(404, 'not_found', 'Report not found');
+    await f.ref.update({ status: 'resolved', resolvedAt: Date.now() }); await aud(ctx, 'report_resolve', { id: ctx.body.id });
+  });
 
-  // ---------- groups / DMs (still in MAIN Firestore until the app is moved to the chat service) ----------
   const MSGPATH = /^(groups\/[A-Za-z0-9_-]+\/messages|[A-Za-z0-9_]+\/[A-Za-z0-9_-]+\/messages)\/[A-Za-z0-9_-]+$/;
-  adm('GET', '/admin/groups', async () => ({ groups: (await M().collection('groups').limit(50).get()).docs.map((x) => ({ id: x.id, isGroup: true, ...x.data() })) }));
-  adm('GET', '/admin/group/:gid', async (ctx) => { const s = await M().collection('groups').doc(id(ctx.params.gid)).get(); if (!s.exists) throw new HttpError(404, 'not_found', 'Group not found'); const g = s.data(); return { group: { id: s.id, name: g.name, members: (g.members || []).length, public: !!g.public, ownerUid: g.ownerUid || '' } }; });
+  adm('GET', '/admin/groups', async () => {
+    const out = [];
+    for (const d of dbs()) { const r = await legacySafe(() => d.collection('groups').limit(50).get()); if (r) r.docs.forEach((x) => out.push({ id: x.id, isGroup: true, ...x.data() })); }
+    return { groups: uniq(out, (x) => x.id).slice(0, 50) };
+  });
+  adm('GET', '/admin/group/:gid', async (ctx) => {
+    const f = await pick('groups/' + id(ctx.params.gid)); if (!f) throw new HttpError(404, 'not_found', 'Group not found');
+    const g = f.snap.data(); return { group: { id: f.snap.id, name: g.name, members: (g.members || []).length, public: !!g.public, ownerUid: g.ownerUid || '' } };
+  });
   adm('POST', '/admin/group/delete', async (ctx) => {
-    const gid = id(ctx.body.gid), ref = M().collection('groups').doc(gid); let n = 0;
-    for (;;) { const s = await ref.collection('messages').limit(400).get(); if (s.empty) break; const b = M().batch(); s.docs.forEach((x) => b.delete(x.ref)); await b.commit(); n += s.size; }
-    await ref.delete(); await aud(ctx, 'group_delete', { gid, messages: n }); return { messages: n };
+    const gid = id(ctx.body.gid), f = await pick('groups/' + gid); if (!f) throw new HttpError(404, 'not_found', 'Group not found');
+    let n = 0;
+    for (;;) { const s = await f.ref.collection('messages').limit(400).get(); if (s.empty) break; const b = f.d.batch(); s.docs.forEach((x) => b.delete(x.ref)); await b.commit(); n += s.size; }
+    await f.ref.delete(); await aud(ctx, 'group_delete', { gid, messages: n }); return { messages: n };
   }, [10, 60]);
-  adm('GET', '/admin/dm-messages', async () => { try { const s = await M().collectionGroup('messages').orderBy('createdAt', 'desc').limit(100).get(); return { items: s.docs.map((x) => { const v = x.data(); return { id: x.id, _path: x.ref.path, ...v, createdAt: v.createdAt && v.createdAt.toMillis ? v.createdAt.toMillis() : v.createdAt }; }) }; } catch { return { items: [] }; } });
+  adm('GET', '/admin/dm-messages', async () => {
+    const out = [];
+    for (const d of dbs()) {
+      const r = await legacySafe(() => d.collectionGroup('messages').orderBy('createdAt', 'desc').limit(100).get());
+      if (r) r.docs.forEach((x) => { const v = x.data(); out.push({ id: x.id, _path: x.ref.path, ...v, createdAt: ms(v.createdAt) }); });
+    }
+    return { items: uniq(out, (x) => x._path).sort((a, b) => (Number(b.createdAt) || 0) - (Number(a.createdAt) || 0)).slice(0, 100) };
+  });
   adm('POST', '/admin/msg', async (ctx) => {                   // pin | unpin | hide | delete on a group / DM message
     const path = String(ctx.body.path || ''); if (!MSGPATH.test(path)) throw new HttpError(400, 'bad_path', 'Not a message path');
-    const ref = M().doc(path), op = ctx.body.op;
+    const f = await pick(path); if (!f) throw new HttpError(404, 'not_found', 'Message not found');
+    const op = ctx.body.op, ref = f.ref;
     if (op === 'pin' || op === 'unpin') await ref.update({ pinned: op === 'pin' }); else if (op === 'hide') await ref.update({ deleted: true, text: '', hiddenBy: 'admin' }); else if (op === 'delete') await ref.delete(); else throw new HttpError(400, 'bad_op', 'Unknown op');
     await aud(ctx, 'msg_' + op, { path });
   }, [60, 60]);
