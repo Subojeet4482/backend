@@ -88,7 +88,7 @@ export function registerAll() {
     if (b.privacy !== undefined) { if (!['public', 'friends', 'private'].includes(b.privacy)) throw new HttpError(400, 'bad_privacy', 'Invalid privacy'); patch.privacy = b.privacy; }
     for (const k of ['photoUrl', 'coverURL']) if (b[k] !== undefined) {
       const v = String(b[k]), lim = k === 'photoUrl' ? 60000 : 200000;
-      if (v && !/^data:image\/(jpeg|png|webp);base64,[A-Za-z0-9+/=]+$/.test(v) && !/^https:\/\/[^\s]{5,480}$/.test(v)) throw new HttpError(400, 'bad_url', 'Invalid image');
+      if (v && !/^data:image\/(jpeg|png|webp);base64,[A-Za-z0-9+/=]+$/.test(v) && !/^https:\/\/[^\s"'<>\\`]{5,480}$/.test(v)) throw new HttpError(400, 'bad_url', 'Invalid image');   // FIX: quotes / <> would break out of <img src="..."> (stored XSS)
       if (v.length > lim) throw new HttpError(400, 'image_big', 'Image too large'); patch[k] = v;
     }
     if (!Object.keys(patch).length) throw new HttpError(400, 'nothing', 'Nothing to update');
@@ -185,5 +185,5 @@ export function registerAll() {
     if (!webhookOk(ctx.req)) { console.warn('[tg:%s] webhook REJECTED: secret mismatch (Render TG_WEBHOOK_SECRET %s)', 'chat', env('TG_WEBHOOK_SECRET') ? 'is set' : 'is EMPTY'); throw new HttpError(401, 'bad_secret', 'Unauthorized'); }
     try { await handleUpdate(ctx.body); } catch (e) { console.error('tg', e); }
   });
-  svc.add('GET', '/cron/daily', { auth: 'cron' }, async () => { const exported = await exportOldMessages(); await purgeExpired(() => db.chat(), ['bot_state']); return { exported }; });
+  svc.add('GET', '/cron/daily', { auth: 'cron' }, async () => { let exported = 0, error; try { exported = await exportOldMessages(); } catch (e) { error = String((e && e.message) || e).slice(0, 160); console.error('[chat cron/daily] export failed', e); } await purgeExpired(() => db.chat(), ['bot_state']); return { exported, ...(error ? { error } : {}) }; });   // FIX: a failing export no longer skips the purge
 }
