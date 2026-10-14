@@ -7,6 +7,9 @@ import { HttpError, sha, r2, env } from './base.js';
 import { callInternal } from './internal.js';
 
 const num = (v) => (Number.isFinite(+v) ? +v : 0);
+// Transaction docs store the amount as a display string ("-₹100", "+₹50.5"). Parse it back to a positive number.
+// (FIX: decideWithdraw/decideDeposit called money() but it was never defined -> every approve/reject/refund crashed with ReferenceError)
+const money = (v) => r2(Math.abs(parseFloat(String(v ?? '').replace(/[^\d.]/g, '')) || 0));
 export const depBal = (u) => num(u.depositBalance !== undefined ? u.depositBalance : u.balance);
 export const wdBal = (u) => num(u.withdrawBalance);
 export const isBanned = (u) => {
@@ -204,6 +207,7 @@ export async function joinMatch(uid, { matchId, gameName, gameUid }, ctx) {
   matchId = String(matchId || ''); gameName = String(gameName || '').trim(); gameUid = String(gameUid || '').trim();
   if (!/^[A-Za-z0-9_-]{4,40}$/.test(matchId)) throw new HttpError(400, 'bad_match', 'Invalid match');
   if (gameName.length < 3 || gameName.length > 30) throw new HttpError(400, 'bad_name', 'Name too short');
+  if (/[<>\u0000-\u001f]/.test(gameName)) throw new HttpError(400, 'bad_name', 'Game name cannot contain < > or control characters');   // FIX: stored XSS via participant list
   if (!/^\d{6,12}$/.test(gameUid)) throw new HttpError(400, 'bad_uid', 'FF UID invalid (6-12 digits)');
   const d = db.main(), mref = d.collection('matches').doc(matchId), uref = d.collection('users').doc(uid), tref = uref.collection('transactions').doc();
   return d.runTransaction(async (tx) => {
